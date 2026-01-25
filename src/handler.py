@@ -8,7 +8,7 @@ from vllm import LLM, EngineArgs
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-0.6B")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
-GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.85"))
+GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.95"))
 TRUST_REMOTE_CODE = os.environ.get('TRUST_REMOTE_CODE', 'False').lower() == 'true'
 
 # Chunked processing configuration for handling long texts
