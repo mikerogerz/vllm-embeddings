@@ -5,7 +5,7 @@ RUN mkdir -p /usr/lib64 && \
 
 RUN uv pip install --system --no-cache-dir "runpod>=1.8,<2.0" huggingface-hub hf-transfer
 
-ARG MODEL_NAME=""
+ARG MODEL_NAME="Qwen/Qwen3-Embedding-8B"
 ARG BASE_PATH="/runpod-volume"
 ARG MODEL_REVISION=""
 
