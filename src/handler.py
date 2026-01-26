@@ -6,7 +6,7 @@ from dataclasses import asdict
 
 from vllm import LLM, EngineArgs
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-0.6B")
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-8B")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.95"))
 TRUST_REMOTE_CODE = os.environ.get('TRUST_REMOTE_CODE', 'False').lower() == 'true'
@@ -32,7 +32,7 @@ def initialize_model():
 			model=MODEL_NAME,
 			runner="pooling",
 			trust_remote_code=TRUST_REMOTE_CODE,
-			max_model_len=-1,
+			#max_model_len=-1,
 			enforce_eager=True,
 			gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
 			download_dir=DOWNLOAD_DIR,
