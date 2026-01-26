@@ -32,7 +32,7 @@ def initialize_model():
 			model=MODEL_NAME,
 			runner="pooling",
 			trust_remote_code=TRUST_REMOTE_CODE,
-			max_model_len="auto",
+			max_model_len=-1,
 			enforce_eager=True,
 			gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
 			download_dir=DOWNLOAD_DIR,
