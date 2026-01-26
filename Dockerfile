@@ -14,7 +14,6 @@ ENV MODEL_NAME=$MODEL_NAME \
 	BASE_PATH=$BASE_PATH
 
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
-ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 ENV PYTHONUNBUFFERED=1
 
 # Chunked processing configuration for long texts
@@ -26,13 +25,9 @@ ENV POOLING_TYPE="LAST"
 # Models will be automatically downloaded to /runpod-volume
 ENV HUGGINGFACE_HUB_CACHE="${BASE_PATH}/huggingface-cache/hub" \
 	HF_HOME="${BASE_PATH}/.cache/huggingface" \
-	#HF_HUB_CACHE="${BASE_PATH}/.cache/huggingface/hub" \
 	HF_HUB_ENABLE_HF_TRANSFER=0
 
 ENV PYTHONPATH="/:/vllm-workspace"
-
-# Create cache directories
-#RUN mkdir -p /runpod-volume/.cache/huggingface
 
 COPY src .
 

@@ -57,7 +57,6 @@ def handler(event):
 	input = event['input']
 	
 	prompt = input.get('prompt')
-	seconds = input.get('seconds', 0)
 	
 	# Convert input to list format
 	if isinstance(prompt, str):
