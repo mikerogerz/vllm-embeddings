@@ -28,15 +28,22 @@ def initialize_model():
 			"max_embed_len": MAX_EMBED_LEN
 		}
 		
+		rope_scaling_config = {
+			"rope_type": "yarn",
+			"factor": 4.0,
+			"original_max_position_embeddings": 32768
+		}
+		
 		engine_args = EngineArgs(
 			model=MODEL_NAME,
 			runner="pooling",
 			trust_remote_code=TRUST_REMOTE_CODE,
-			#max_model_len=-1,
+			max_model_len=131072,
 			enforce_eager=True,
 			gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
 			download_dir=DOWNLOAD_DIR,
-			pooler_config=pooler_config
+			pooler_config=pooler_config,
+			rope_scaling=rope_scaling_config
 		)
 		
 		try:
