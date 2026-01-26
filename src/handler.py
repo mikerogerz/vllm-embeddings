@@ -31,6 +31,7 @@ def initialize_model():
 		engine_args = EngineArgs(
 			model=MODEL_NAME,
 			runner="pooling",
+			task="embed",
 			trust_remote_code=TRUST_REMOTE_CODE,
 			max_model_len=-1,
 			enforce_eager=True,
