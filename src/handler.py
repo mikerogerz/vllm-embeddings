@@ -101,7 +101,7 @@ def handler(event):
 		print(f"Detected {len(long_texts)} potentially long text(s) - chunked processing will handle automatically")
 	
 	start_time = time.time()
-	outputs = model.embed(texts, use_tqdm=False)
+	outputs = model.embed(texts, use_tqdm=False, truncate_prompt_tokens=model.llm_engine.model_config.max_model_len)
 	inference_time = time.time() - start_time
 	
 	embeddings = [output.outputs.embedding for output in outputs]
