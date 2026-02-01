@@ -1,5 +1,7 @@
 import os
 import time
+import gc
+import torch
 import runpod
 
 from dataclasses import asdict
@@ -130,6 +132,13 @@ def handler(event):
 	
 	print(f"Generated {len(embeddings)} embeddings in {inference_time:.2f}s")
 	print(f"Avg time per embedding: {inference_time/len(embeddings):.3f}s")
+	
+	gc.collect()
+	torch.cuda.empty_cache()
+	
+	# Reset CUDA device to fully clear memory
+	torch.cuda.reset_peak_memory_stats()
+	torch.cuda.synchronize()  # Wait for all streams on the current device
 	
 	return response
 
