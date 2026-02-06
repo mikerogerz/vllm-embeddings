@@ -10,7 +10,7 @@ from vllm import LLM, EngineArgs
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-8B")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
-GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.95"))
+GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.9"))
 TRUST_REMOTE_CODE = os.environ.get('TRUST_REMOTE_CODE', 'False').lower() == 'true'
 
 # Chunked processing configuration for handling long texts
@@ -133,12 +133,14 @@ def handler(event):
 	print(f"Generated {len(embeddings)} embeddings in {inference_time:.2f}s")
 	print(f"Avg time per embedding: {inference_time/len(embeddings):.3f}s")
 	
+	'''
 	gc.collect()
 	torch.cuda.empty_cache()
 	
 	# Reset CUDA device to fully clear memory
 	torch.cuda.reset_peak_memory_stats()
 	torch.cuda.synchronize()  # Wait for all streams on the current device
+	'''
 	
 	return response
 
