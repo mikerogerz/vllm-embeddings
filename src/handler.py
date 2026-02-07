@@ -10,7 +10,7 @@ from vllm import LLM, EngineArgs
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-8B")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
-GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.9"))
+GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.95"))
 TRUST_REMOTE_CODE = os.environ.get('TRUST_REMOTE_CODE', 'False').lower() == 'true'
 
 # Chunked processing configuration for handling long texts
@@ -38,6 +38,7 @@ def initialize_model():
 			max_model_len=-1,
 			enforce_eager=True,
 			gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+			enable_sleep_mode=True,
 			download_dir=DOWNLOAD_DIR,
 			pooler_config=pooler_config
 		)
@@ -102,9 +103,13 @@ def handler(event):
 	if long_texts and ENABLE_CHUNKED_PROCESSING:
 		print(f"Detected {len(long_texts)} potentially long text(s) - chunked processing will handle automatically")
 	
+	model.wake_up()
+	
 	start_time = time.time()
 	outputs = model.embed(texts, use_tqdm=False, truncate_prompt_tokens=model.llm_engine.model_config.max_model_len-1)
 	inference_time = time.time() - start_time
+	
+	model.sleep(level=1)
 	
 	embeddings = [output.outputs.embedding for output in outputs]
 	
