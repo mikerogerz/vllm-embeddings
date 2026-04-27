@@ -6,7 +6,8 @@ import runpod
 
 from dataclasses import asdict
 
-from vllm import LLM, EngineArgs
+from vllm import EngineArgs, LLMEngine
+from vllm.config import PoolerConfig
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-8B")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
@@ -23,12 +24,12 @@ llm = None
 def initialize_model():
 	global llm
 	if llm is None:
-		pooler_config = {
-			"pooling_type": POOLING_TYPE,
-			"use_activation": True,
-			"enable_chunked_processing": ENABLE_CHUNKED_PROCESSING,
-			"max_embed_len": MAX_EMBED_LEN
-		}
+		pooler_config = PoolerConfig(
+			pooling_type=POOLING_TYPE,
+			use_activation=True,
+			enable_chunked_processing=ENABLE_CHUNKED_PROCESSING,
+			max_embed_len=MAX_EMBED_LEN
+		)
 		
 		engine_args = EngineArgs(
 			model=MODEL_NAME,
@@ -44,7 +45,7 @@ def initialize_model():
 		)
 		
 		try:
-			llm = LLM(**asdict(engine_args))
+			llm = LLMEngine.from_engine_args(engine_args)
 		except Exception as e:
 			print(f"Error loading model: {str(e)}")
 			raise
