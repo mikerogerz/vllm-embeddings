@@ -100,7 +100,7 @@ def handler(event):
 	print(f"Text lengths (chars): min={min(text_lengths)}, max={max(text_lengths)}, avg={sum(text_lengths)//len(text_lengths)}")
 	
 	# Check for potentially long texts
-	long_text_threshold = model.llm_engine.model_config.max_model_len * 3  # Rough char estimate
+	long_text_threshold = model.model_config.max_model_len * 3  # Rough char estimate
 	long_texts = [i for i, length in enumerate(text_lengths) if length > long_text_threshold]
 	if long_texts and ENABLE_CHUNKED_PROCESSING:
 		print(f"Detected {len(long_texts)} potentially long text(s) - chunked processing will handle automatically")
