@@ -11,7 +11,7 @@ from vllm.config import PoolerConfig
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-8B")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
-GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.95"))
+GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
 TRUST_REMOTE_CODE = os.environ.get('TRUST_REMOTE_CODE', 'False').lower() == 'true'
 
 # Chunked processing configuration for handling long texts
@@ -38,6 +38,7 @@ def initialize_model():
 			trust_remote_code=TRUST_REMOTE_CODE,
 			max_model_len=-1,
 			enforce_eager=True,
+			enable_prefix_caching=True,
 			gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
 			enable_sleep_mode=True,
 			download_dir=DOWNLOAD_DIR,
