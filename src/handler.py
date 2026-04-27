@@ -4,9 +4,7 @@ import gc
 import torch
 import runpod
 
-from dataclasses import asdict
-
-from vllm import EngineArgs, LLMEngine
+from vllm import LLM
 from vllm.config import PoolerConfig
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-8B")
@@ -31,22 +29,20 @@ def initialize_model():
 			max_embed_len=MAX_EMBED_LEN
 		)
 		
-		engine_args = EngineArgs(
-			model=MODEL_NAME,
-			runner="pooling",
-			convert="embed",
-			trust_remote_code=TRUST_REMOTE_CODE,
-			max_model_len=-1,
-			enforce_eager=True,
-			enable_prefix_caching=True,
-			gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-			enable_sleep_mode=True,
-			download_dir=DOWNLOAD_DIR,
-			pooler_config=pooler_config
-		)
-		
 		try:
-			llm = LLMEngine.from_engine_args(engine_args)
+			llm = LLM(
+				model=MODEL_NAME,
+				runner="pooling",
+				convert="embed",
+				trust_remote_code=TRUST_REMOTE_CODE,
+				max_model_len=-1,
+				enforce_eager=True,
+				enable_prefix_caching=True,
+				gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+				enable_sleep_mode=True,
+				download_dir=DOWNLOAD_DIR,
+				pooler_config=pooler_config
+			)
 		except Exception as e:
 			print(f"Error loading model: {str(e)}")
 			raise
@@ -100,7 +96,7 @@ def handler(event):
 	print(f"Text lengths (chars): min={min(text_lengths)}, max={max(text_lengths)}, avg={sum(text_lengths)//len(text_lengths)}")
 	
 	# Check for potentially long texts
-	long_text_threshold = model.model_config.max_model_len * 3  # Rough char estimate
+	long_text_threshold = model.llm_engine.model_config.max_model_len * 3  # Rough char estimate
 	long_texts = [i for i, length in enumerate(text_lengths) if length > long_text_threshold]
 	if long_texts and ENABLE_CHUNKED_PROCESSING:
 		print(f"Detected {len(long_texts)} potentially long text(s) - chunked processing will handle automatically")
@@ -108,7 +104,7 @@ def handler(event):
 	model.wake_up()
 	
 	start_time = time.time()
-	outputs = model.embed(texts, use_tqdm=False, truncate_prompt_tokens=model.model_config.max_model_len-1)
+	outputs = model.embed(texts, use_tqdm=False, truncate_prompt_tokens=model.llm_engine.model_config.max_model_len-1)
 	inference_time = time.time() - start_time
 	
 	model.sleep(level=1)
