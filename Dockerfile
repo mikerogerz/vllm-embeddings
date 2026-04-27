@@ -1,7 +1,4 @@
-FROM vllm/vllm-openai:v0.14.1
-
-RUN mkdir -p /usr/lib64 && \
-	ln -s /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so /usr/lib64/libcuda.so
+FROM vllm/vllm-openai:v0.19.1
 
 RUN uv pip install --system --no-cache-dir "runpod>=1.8,<2.0" huggingface-hub hf-transfer
 
