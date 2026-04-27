@@ -108,7 +108,7 @@ def handler(event):
 	model.wake_up()
 	
 	start_time = time.time()
-	outputs = model.embed(texts, use_tqdm=False, truncate_prompt_tokens=model.llm_engine.model_config.max_model_len-1)
+	outputs = model.embed(texts, use_tqdm=False, truncate_prompt_tokens=model.model_config.max_model_len-1)
 	inference_time = time.time() - start_time
 	
 	model.sleep(level=1)
