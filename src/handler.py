@@ -11,7 +11,7 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-8B")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
 TRUST_REMOTE_CODE = os.environ.get('TRUST_REMOTE_CODE', 'False').lower() == 'true'
-MAX_CONCURRENCY = int(os.environ.get('MAX_CONCURRENCY', 3))
+MAX_CONCURRENCY = int(os.environ.get('MAX_CONCURRENCY', 5))
 
 # Chunked processing configuration for handling long texts
 ENABLE_CHUNKED_PROCESSING = os.environ.get("ENABLE_CHUNKED_PROCESSING", 'true').lower() == 'true'
