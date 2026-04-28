@@ -39,7 +39,7 @@ def initialize_model():
 				enforce_eager=True,
 				enable_prefix_caching=True,
 				gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-				enable_sleep_mode=True,
+				#enable_sleep_mode=True,
 				download_dir=DOWNLOAD_DIR,
 				pooler_config=pooler_config
 			)
@@ -101,7 +101,7 @@ def handler(event):
 	if long_texts and ENABLE_CHUNKED_PROCESSING:
 		print(f"Detected {len(long_texts)} potentially long text(s) - chunked processing will handle automatically")
 	
-	model.wake_up()
+	#model.wake_up()
 	
 	start_time = time.time()
 	outputs = model.embed(
@@ -111,7 +111,7 @@ def handler(event):
 	)
 	inference_time = time.time() - start_time
 	
-	model.sleep(level=1)
+	#model.sleep(level=1)
 	
 	embeddings = [output.outputs.embedding for output in outputs]
 	
