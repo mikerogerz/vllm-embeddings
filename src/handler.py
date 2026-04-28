@@ -83,7 +83,7 @@ async def process_request(job):
 		}
 	
 	# Get encoding format (default: float)
-	encoding_format = input.get("encoding_format", "float")
+	encoding_format = job_input.get("encoding_format", "float")
 	if encoding_format not in ["float", "base64"]:
 		return {
 			"error": "encoding_format must be 'float' or 'base64'"
