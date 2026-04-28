@@ -11,6 +11,7 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-8B")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
 TRUST_REMOTE_CODE = os.environ.get('TRUST_REMOTE_CODE', 'False').lower() == 'true'
+MAX_CONCURRENCY = int(os.environ.get('MAX_CONCURRENCY', 3))
 
 # Chunked processing configuration for handling long texts
 ENABLE_CHUNKED_PROCESSING = os.environ.get("ENABLE_CHUNKED_PROCESSING", 'true').lower() == 'true'
@@ -55,10 +56,10 @@ def initialize_model():
 #
 #    Returns:
 #       Any: The result to be returned to the client
-def handler(event):
-	input = event['input']
+async def process_request(job):
+	job_input = job['input']
 	
-	prompt = input.get('prompt')
+	prompt = job_input.get('prompt')
 	
 	# Convert input to list format
 	if isinstance(prompt, str):
@@ -154,5 +155,6 @@ def handler(event):
 # Start the Serverless function when the script is run
 if __name__ == '__main__':
 	runpod.serverless.start({
-		'handler': handler
+		'handler': process_request,
+		'concurrency_modifier': lambda x: MAX_CONCURRENCY
 	})
