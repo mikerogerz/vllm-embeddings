@@ -1,4 +1,4 @@
-FROM vllm/vllm-openai:v0.20.0-cu129-ubuntu2404
+FROM vllm/vllm-openai:v0.20.1-cu129-ubuntu2404
 
 RUN uv pip install --system --no-cache-dir "runpod>=1.8,<2.0" huggingface-hub hf-transfer
 
