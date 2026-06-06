@@ -1,160 +1,239 @@
 import os
 import time
-import gc
-import torch
+import asyncio
+import uuid
+import base64
+import struct
 import runpod
 
-from vllm import LLM
+from vllm import AsyncLLMEngine, AsyncEngineArgs
 from vllm.config import PoolerConfig
+from vllm.sampling_params import PoolingParams
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-8B")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
-TRUST_REMOTE_CODE = os.environ.get('TRUST_REMOTE_CODE', 'False').lower() == 'true'
-MAX_CONCURRENCY = int(os.environ.get('MAX_CONCURRENCY', 5))
-
-# Chunked processing configuration for handling long texts
-ENABLE_CHUNKED_PROCESSING = os.environ.get("ENABLE_CHUNKED_PROCESSING", 'true').lower() == 'true'
-MAX_EMBED_LEN = int(os.environ.get("MAX_EMBED_LEN", "3072000")) # Max tokens for embedding input
+TRUST_REMOTE_CODE = os.environ.get("TRUST_REMOTE_CODE", "False").lower() == "true"
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", 5))
+ENABLE_CHUNKED_PROCESSING = os.environ.get("ENABLE_CHUNKED_PROCESSING", "true").lower() == "true"
+MAX_EMBED_LEN = int(os.environ.get("MAX_EMBED_LEN", "3072000"))
 POOLING_TYPE = os.environ.get("POOLING_TYPE", "LAST")
 
-llm = None
+# ---------------------------------------------------------------------------
+# Lazy async engine singleton
+# ---------------------------------------------------------------------------
 
-def initialize_model():
-	global llm
-	if llm is None:
+_engine: AsyncLLMEngine | None = None
+_max_model_len: int | None = None
+_engine_lock = asyncio.Lock()
+
+async def get_engine() -> tuple[AsyncLLMEngine, int]:
+	"""Initialise AsyncLLMEngine once; subsequent calls return the cached instance."""
+	global _engine, _max_model_len
+
+	# Fast path – engine already ready
+	if _engine is not None:
+		return _engine, _max_model_len
+
+	async with _engine_lock:
+		# Second check inside the lock to guard against simultaneous initialisers
+		if _engine is not None:
+			return _engine, _max_model_len
+
 		pooler_config = PoolerConfig(
 			pooling_type=POOLING_TYPE,
 			use_activation=True,
 			enable_chunked_processing=ENABLE_CHUNKED_PROCESSING,
-			max_embed_len=MAX_EMBED_LEN
+			max_embed_len=MAX_EMBED_LEN,
 		)
-		
-		try:
-			llm = LLM(
-				model=MODEL_NAME,
-				runner="pooling",
-				convert="embed",
-				trust_remote_code=TRUST_REMOTE_CODE,
-				max_model_len=-1,
-				enforce_eager=True,
-				enable_prefix_caching=True,
-				gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-				#enable_sleep_mode=True,
-				download_dir=DOWNLOAD_DIR,
-				pooler_config=pooler_config
-			)
-		except Exception as e:
-			print(f"Error loading model: {str(e)}")
-			raise
-	return llm
 
-#   This function processes incoming requests to your Serverless endpoint.
-#
-#    Args:
-#        event (dict): Contains the input data and request metadata
-#
-#    Returns:
-#       Any: The result to be returned to the client
-async def process_request(job):
-	job_input = job['input']
-	
-	prompt = job_input.get('prompt')
-	
-	# Convert input to list format
+		engine_args = AsyncEngineArgs(
+			model=MODEL_NAME,
+			task="embed", # configure engine for embedding
+			trust_remote_code=TRUST_REMOTE_CODE,
+			max_model_len=None, # auto-detect from model config
+			enforce_eager=True,
+			enable_prefix_caching=True,
+			gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+			download_dir=DOWNLOAD_DIR,
+			override_pooler_config=pooler_config,
+		)
+
+		_engine = AsyncLLMEngine.from_engine_args(engine_args)
+
+		# Retrieve the resolved max_model_len from the running engine
+		model_config = await _engine.get_model_config()
+		_max_model_len = model_config.max_model_len
+
+		print(f"[init] Engine ready — model={MODEL_NAME}  max_model_len={_max_model_len}")
+
+	return _engine, _max_model_len
+
+# ---------------------------------------------------------------------------
+# Per-text embedding helper
+# ---------------------------------------------------------------------------
+
+async def embed_text(
+	engine: AsyncLLMEngine,
+	text: str,
+	request_id: str,
+	truncate_len: int,
+) -> list[float]:
+	"""
+	Embed a single piece of text.
+
+	vLLM's AsyncLLMEngine.encode() is itself an async generator that yields
+	incremental EmbeddingRequestOutput objects as the request progresses through
+	the engine's continuous batching loop.  We drain the generator and keep only
+	the final output, which contains the complete embedding vector.
+	"""
+	pooling_params = PoolingParams()
+	final_output = None
+
+	async for output in engine.encode(
+		{"prompt": text, "truncate_prompt_tokens": truncate_len},
+		pooling_params=pooling_params,
+		request_id=request_id,
+	):
+		# Each iteration may be a partial/intermediate result; overwrite until done
+		final_output = output
+
+	if final_output is None:
+		raise RuntimeError(f"Engine returned no output for request '{request_id}'")
+
+	return list(final_output.outputs.embedding)
+
+# ---------------------------------------------------------------------------
+# Encoding helpers
+# ---------------------------------------------------------------------------
+
+def to_base64(embedding: list[float]) -> str:
+	"""Pack a float32 embedding as a base64 string (OpenAI-compatible format)."""
+	return base64.b64encode(
+		struct.pack(f"{len(embedding)}f", *embedding)
+	).decode("utf-8")
+
+# ---------------------------------------------------------------------------
+# RunPod handler  (async generator → enables streaming + concurrent jobs)
+# ---------------------------------------------------------------------------
+
+async def handler(job):
+	"""
+	RunPod serverless handler.
+
+	Declaring this as an async generator (uses `yield`) lets RunPod:
+	  • run multiple jobs concurrently within the same worker process, and
+	  • stream partial results back to callers when appropriate.
+
+	For embedding workloads we yield once with the complete response; the
+	concurrent-request benefit comes from AsyncLLMEngine batching all
+	per-text encode() calls that arrive during the same scheduling window.
+	"""
+	job_input = job["input"]
+	prompt    = job_input.get("prompt")
+
+	# ---- Input validation ----
+
 	if isinstance(prompt, str):
 		texts = [prompt]
 	elif isinstance(prompt, list):
 		texts = prompt
 	else:
-		return {
-			"error": "'input' must be a string or list of strings"
-		}
-	
-	if len(texts) == 0:
-		return {
-			"error": "Empty input"
-		}
-	
-	# Validate all inputs are strings
-	if not all(isinstance(text, str) for text in texts):
-		return {
-			"error": "All inputs must be strings"
-		}
-	
-	# Get encoding format (default: float)
+		yield {"error": "'prompt' must be a string or list of strings"}
+		return
+
+	if not texts:
+		yield {"error": "Empty input"}
+		return
+
+	if not all(isinstance(t, str) for t in texts):
+		yield {"error": "All items in 'prompt' must be strings"}
+		return
+
 	encoding_format = job_input.get("encoding_format", "float")
-	if encoding_format not in ["float", "base64"]:
-		return {
-			"error": "encoding_format must be 'float' or 'base64'"
-		}
-	
-	model = initialize_model()
-	
-	# Log information about input lengths
-	text_lengths = [len(text) for text in texts]
-	print(f"Generating embeddings for {len(texts)} text(s)")
-	print(f"Text lengths (chars): min={min(text_lengths)}, max={max(text_lengths)}, avg={sum(text_lengths)//len(text_lengths)}")
-	
-	# Check for potentially long texts
-	long_text_threshold = model.llm_engine.model_config.max_model_len * 3  # Rough char estimate
-	long_texts = [i for i, length in enumerate(text_lengths) if length > long_text_threshold]
-	if long_texts and ENABLE_CHUNKED_PROCESSING:
-		print(f"Detected {len(long_texts)} potentially long text(s) - chunked processing will handle automatically")
-	
-	#model.wake_up()
-	
-	start_time = time.time()
-	outputs = model.embed(
-		texts,
-		use_tqdm=False,
-		tokenization_kwargs=dict(truncate_prompt_tokens=model.llm_engine.model_config.max_model_len-1) # change to auto? (-1)
+	if encoding_format not in ("float", "base64"):
+		yield {"error": "encoding_format must be 'float' or 'base64'"}
+		return
+
+	# ---- Engine init (idempotent) ----
+
+	try:
+		engine, max_model_len = await get_engine()
+	except Exception as exc:
+		yield {"error": f"Engine initialisation failed: {exc}"}
+		return
+
+	truncate_len = max_model_len - 1
+	job_id = job.get("id", str(uuid.uuid4()))
+
+	text_lengths = [len(t) for t in texts]
+	print(
+		f"[{job_id}] Embedding {len(texts)} text(s) — "
+		f"chars: min={min(text_lengths)}, max={max(text_lengths)}, "
+		f"avg={sum(text_lengths) // len(text_lengths)}"
 	)
-	inference_time = time.time() - start_time
-	
-	#model.sleep(level=1)
-	
-	embeddings = [output.outputs.embedding for output in outputs]
-	
-	data = []
-	for idx, embedding in enumerate(embeddings):
-		data.append({
+
+	# ---- Concurrent embedding ----
+	#
+	# asyncio.gather fans out one engine.encode() coroutine per text.
+	# Because AsyncLLMEngine runs a background scheduling loop, all of these
+	# requests are visible to the engine at once and get batched together,
+	# giving true GPU-level concurrency rather than sequential inference.
+
+	start = time.time()
+
+	try:
+		embeddings: list[list[float]] = await asyncio.gather(*[
+			embed_text(engine, text, f"{job_id}-{i}", truncate_len)
+			for i, text in enumerate(texts)
+		])
+	except Exception as exc:
+		yield {"error": f"Embedding failed: {exc}"}
+		return
+
+	elapsed = time.time() - start
+
+	# ---- Build response ----
+
+	data = [
+		{
 			"object": "embedding",
-			"embedding": embedding,
-			"index": idx
-		})
-	
-	# Estimate token count (rough approximation)
-	total_chars = sum(len(text) for text in texts)
-	estimated_tokens = total_chars // 4  # Rough estimate: 1 token ≈ 4 chars
-	
-	response = {
+			"index": idx,
+			"embedding": to_base64(emb) if encoding_format == "base64" else emb,
+		}
+		for idx, emb in enumerate(embeddings)
+	]
+
+	estimated_tokens = sum(len(t) for t in texts) // 4  # ~4 chars per token
+
+	print(
+		f"[{job_id}] Done — {len(embeddings)} embedding(s) in {elapsed:.2f}s "
+		f"({elapsed / len(embeddings):.3f}s avg)"
+	)
+
+	yield {
 		"object": "list",
 		"data": data,
 		"model": MODEL_NAME,
 		"usage": {
 			"prompt_tokens": estimated_tokens,
-			"total_tokens": estimated_tokens
-		}
+			"total_tokens":  estimated_tokens,
+		},
 	}
-	
-	print(f"Generated {len(embeddings)} embeddings in {inference_time:.2f}s")
-	print(f"Avg time per embedding: {inference_time/len(embeddings):.3f}s")
-	
-	'''
-	gc.collect()
-	torch.cuda.empty_cache()
-	
-	# Reset CUDA device to fully clear memory
-	torch.cuda.reset_peak_memory_stats()
-	torch.cuda.synchronize()  # Wait for all streams on the current device
-	'''
-	
-	return response
 
-# Start the Serverless function when the script is run
-if __name__ == '__main__':
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
 	runpod.serverless.start({
-		'handler': process_request,
-		'concurrency_modifier': lambda x: MAX_CONCURRENCY
+		"handler": handler,
+		"concurrency_modifier":  lambda x: MAX_CONCURRENCY,
+		# Aggregate all yielded chunks so callers receive a single JSON response
+		# rather than a raw newline-delimited stream.
+		"return_aggregate_stream": True,
 	})
