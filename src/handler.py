@@ -53,14 +53,15 @@ async def get_engine() -> tuple[AsyncLLMEngine, int]:
 
 		engine_args = AsyncEngineArgs(
 			model=MODEL_NAME,
-			task="embed", # configure engine for embedding
+			runner="pooling",
+			convert="embed",
 			trust_remote_code=TRUST_REMOTE_CODE,
 			max_model_len=None, # auto-detect from model config
 			enforce_eager=True,
 			enable_prefix_caching=True,
 			gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
 			download_dir=DOWNLOAD_DIR,
-			override_pooler_config=pooler_config,
+			pooler_config=pooler_config,
 		)
 
 		_engine = AsyncLLMEngine.from_engine_args(engine_args)
