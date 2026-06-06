@@ -8,7 +8,7 @@ import runpod
 
 from vllm import AsyncLLMEngine, AsyncEngineArgs
 from vllm.config import PoolerConfig
-from vllm.sampling_params import PoolingParams
+from vllm.pooling_params import PoolingParams
 
 # ---------------------------------------------------------------------------
 # Configuration
