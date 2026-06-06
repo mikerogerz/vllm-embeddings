@@ -8,7 +8,6 @@ import runpod
 
 from vllm import AsyncLLMEngine, AsyncEngineArgs
 from vllm.config import PoolerConfig
-from vllm.pooling_params import PoolingParams
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -89,13 +88,12 @@ async def embed_text(
 	the engine's continuous batching loop.  We drain the generator and keep only
 	the final output, which contains the complete embedding vector.
 	"""
-	pooling_params = PoolingParams()
 	final_output = None
 
 	async for output in engine.encode(
-		{"prompt": text, "truncate_prompt_tokens": truncate_len},
-		pooling_params=pooling_params,
+		prompt=text,
 		request_id=request_id,
+		tokenization_kwargs=dict(truncate_prompt_tokens=truncate_len)
 	):
 		# Each iteration may be a partial/intermediate result; overwrite until done
 		final_output = output
@@ -103,7 +101,7 @@ async def embed_text(
 	if final_output is None:
 		raise RuntimeError(f"Engine returned no output for request '{request_id}'")
 
-	return list(final_output.outputs.embedding)
+	return list(final_output.outputs.data)
 
 # ---------------------------------------------------------------------------
 # Encoding helpers
