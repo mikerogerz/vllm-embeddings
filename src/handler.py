@@ -6,9 +6,11 @@ import base64
 import struct
 import runpod
 
-from vllm import AsyncLLMEngine, AsyncEngineArgs
+from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.config import PoolerConfig
 from vllm.pooling_params import PoolingParams
+from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.inputs import TextPrompt
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -27,11 +29,11 @@ POOLING_TYPE = os.environ.get("POOLING_TYPE", "LAST")
 # Lazy async engine singleton
 # ---------------------------------------------------------------------------
 
-_engine: AsyncLLMEngine | None = None
+_engine: AsyncLLM | None = None
 _max_model_len: int | None = None
 _engine_lock = asyncio.Lock()
 
-async def get_engine() -> tuple[AsyncLLMEngine, int]:
+async def get_engine() -> tuple[AsyncLLM, int]:
 	"""Initialise AsyncLLMEngine once; subsequent calls return the cached instance."""
 	global _engine, _max_model_len
 
@@ -64,7 +66,7 @@ async def get_engine() -> tuple[AsyncLLMEngine, int]:
 			pooler_config=pooler_config,
 		)
 
-		_engine = AsyncLLMEngine.from_engine_args(engine_args)
+		_engine = AsyncLLM.from_engine_args(engine_args)
 		_max_model_len = _engine.model_config.max_model_len
 
 		print(f"[init] Engine ready — model={MODEL_NAME}  max_model_len={_max_model_len}")
@@ -76,7 +78,7 @@ async def get_engine() -> tuple[AsyncLLMEngine, int]:
 # ---------------------------------------------------------------------------
 
 async def embed_text(
-	engine: AsyncLLMEngine,
+	engine: AsyncLLM,
 	text: str,
 	request_id: str,
 	truncate_len: int,
@@ -93,7 +95,7 @@ async def embed_text(
 	final_output = None
 
 	async for output in engine.encode(
-		prompt=text,
+		TextPrompt(prompt=text),
 		pooling_params=pooling_params,
 		request_id=request_id,
 		tokenization_kwargs=dict(truncate_prompt_tokens=truncate_len)
@@ -220,7 +222,7 @@ async def handler(job):
 		"model": MODEL_NAME,
 		"usage": {
 			"prompt_tokens": estimated_tokens,
-			"total_tokens":  estimated_tokens,
+			"total_tokens": estimated_tokens,
 		},
 	}
 
@@ -231,7 +233,7 @@ async def handler(job):
 if __name__ == "__main__":
 	runpod.serverless.start({
 		"handler": handler,
-		"concurrency_modifier":  lambda x: MAX_CONCURRENCY,
+		"concurrency_modifier": lambda x: MAX_CONCURRENCY,
 		# Aggregate all yielded chunks so callers receive a single JSON response
 		# rather than a raw newline-delimited stream.
 		"return_aggregate_stream": True,
