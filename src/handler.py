@@ -6,11 +6,9 @@ import base64
 import struct
 import runpod
 
-from transformers import AutoTokenizer
-
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.config import PoolerConfig
-from vllm.inputs import TokensPrompt
+from vllm.inputs import TextPrompt
 from vllm.pooling_params import PoolingParams
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -33,12 +31,11 @@ POOLING_TYPE = os.environ.get("POOLING_TYPE", "LAST")
 
 _engine: AsyncLLM | None = None
 _max_model_len: int | None = None
-_tokenizer: AutoTokenizer | None = None
 _engine_lock = asyncio.Lock()
 
 async def get_engine() -> tuple[AsyncLLM, int]:
 	"""Initialise AsyncLLMEngine once; subsequent calls return the cached instance."""
-	global _engine, _max_model_len, _tokenizer
+	global _engine, _max_model_len
 
 	# Fast path – engine already ready
 	if _engine is not None:
@@ -71,10 +68,6 @@ async def get_engine() -> tuple[AsyncLLM, int]:
 
 		_engine = AsyncLLM.from_engine_args(engine_args)
 		_max_model_len = _engine.model_config.max_model_len
-		_tokenizer = AutoTokenizer.from_pretrained(
-			MODEL_NAME,
-			trust_remote_code=TRUST_REMOTE_CODE,
-		)
 
 		print(f"[init] Engine ready — model={MODEL_NAME}  max_model_len={_max_model_len}")
 
@@ -93,28 +86,19 @@ async def embed_text(
 	"""
 	Embed a single piece of text.
 
-	Pre-tokenize with the HF tokenizer so we pass a TokensPrompt to encode().
-	This avoids the deprecated raw-prompt path in the v1 AsyncLLM engine, which
-	requires pre-rendered (tokenized) inputs rather than raw text strings.
-
-	encode() is an async generator that yields incremental EmbeddingRequestOutput
-	objects; we drain it and keep only the final output with the full embedding.
+	vLLM's AsyncLLMEngine.encode() is itself an async generator that yields
+	incremental EmbeddingRequestOutput objects as the request progresses through
+	the engine's continuous batching loop.  We drain the generator and keep only
+	the final output, which contains the complete embedding vector.
 	"""
-	# Tokenize + truncate on the CPU before handing off to the GPU engine
-	token_ids: list[int] = _tokenizer.encode(
-		text,
-		truncation=True,
-		max_length=truncate_len,
-		add_special_tokens=True,
-	)
-
 	pooling_params = PoolingParams()
 	final_output = None
 
 	async for output in engine.encode(
-		TokensPrompt(prompt_token_ids=token_ids),
+		TextPrompt(prompt=text),
 		pooling_params=pooling_params,
 		request_id=request_id,
+		tokenization_kwargs=dict(truncate_prompt_tokens=truncate_len),
 	):
 		# Each iteration may be a partial/intermediate result; overwrite until done
 		final_output = output
