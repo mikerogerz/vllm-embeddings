@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 import asyncio
 import uuid
@@ -234,41 +235,72 @@ async def handler(job):
 # Dynamic concurrency — driven by vLLM's KV-cache analysis log line
 # ---------------------------------------------------------------------------
 
-class _VllmConcurrencyCapture(logging.Handler):
+class _StreamCapture:
 	"""
-	Intercepts the vLLM log line emitted by kv_cache_utils.py:
+	Stream wrapper that intercepts vLLM's KV-cache concurrency log line:
 
-	    Maximum concurrency for 40,960 tokens per request: 4.55x
+	    (EngineCore pid=N) INFO ... Maximum concurrency for 40,960 tokens per request: 4.55x
 
-	The multiplier (e.g. 4.55) reflects how many simultaneous requests
-	the GPU's KV-cache can hold at the configured token budget.  We floor
-	it to an int and store it in _detected_concurrency so that
-	concurrency_modifier() can return it to RunPod on every poll.
+	Why not a logging.Handler?
+	The log line originates in vLLM's EngineCore *subprocess* (note the
+	'pid=N' prefix).  vLLM forwards those records to the main process and
+	prints them directly to stdout, bypassing Python's logging module
+	entirely.  Wrapping the stream itself is the only reliable interception
+	point that works regardless of vLLM's internal logger propagation
+	settings or which process emitted the text.
 	"""
 
 	_PATTERN = re.compile(
 		r'Maximum concurrency for [\d,]+ tokens per request:\s+([\d.]+)x'
 	)
 
-	def emit(self, record: logging.LogRecord) -> None:
+	def __init__(self, stream):
+		self._stream = stream
+		self._buf = ''  # accumulates text until a newline arrives
+
+	def write(self, text: str) -> int:
+		n = self._stream.write(text)
+		self._buf += text
+		# Scan only complete lines so a split write never misses the pattern
+		if '\n' in self._buf:
+			*lines, self._buf = self._buf.split('\n')
+			for line in lines:
+				self._scan(line)
+		return n
+
+	def _scan(self, line: str) -> None:
 		global _detected_concurrency
-		m = self._PATTERN.search(record.getMessage())
+		m = self._PATTERN.search(line)
 		if m:
 			raw = float(m.group(1))
 			_detected_concurrency = max(1, math.floor(raw))
-			print(
-				f'[concurrency] vLLM KV-cache reports {raw}x max concurrency '
-				f'→ RunPod concurrency set to {_detected_concurrency}'
+			self._stream.write(
+				f'[concurrency] vLLM KV-cache reports {raw}x max '
+				f'→ RunPod concurrency set to {_detected_concurrency}\n'
 			)
+			self._stream.flush()
+
+	def flush(self) -> None:
+		self._stream.flush()
+
+	def fileno(self) -> int:
+		# Required for subprocess / low-level I/O that checks the fd
+		return self._stream.fileno()
+
+	def __getattr__(self, name: str):
+		# Proxy everything else (encoding, isatty, etc.) to the real stream
+		return getattr(self._stream, name)
 
 def _install_concurrency_capture() -> None:
 	"""
-	Attach _VllmConcurrencyCapture to the root logger so it intercepts
-	every log record regardless of which vLLM sub-logger emitted it.
-	Called once before runpod.serverless.start().
+	Redirect sys.stdout and sys.stderr through _StreamCapture.
+	Called once before runpod.serverless.start() so the wrapper is in
+	place before the engine is initialised on the first job.
 	"""
-	handler = _VllmConcurrencyCapture(level=logging.INFO)
-	logging.getLogger().addHandler(handler)
+	if not isinstance(sys.stdout, _StreamCapture):
+		sys.stdout = _StreamCapture(sys.stdout)
+	if not isinstance(sys.stderr, _StreamCapture):
+		sys.stderr = _StreamCapture(sys.stderr)
 
 def concurrency_modifier(current_concurrency: int) -> int:
 	"""
