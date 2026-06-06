@@ -1,4 +1,7 @@
+import logging
+import math
 import os
+import re
 import time
 import asyncio
 import uuid
@@ -29,6 +32,7 @@ POOLING_TYPE = os.environ.get("POOLING_TYPE", "LAST")
 # Lazy async engine singleton
 # ---------------------------------------------------------------------------
 
+_detected_concurrency: int | None = None # set from vLLM's KV-cache log line
 _engine: AsyncLLM | None = None
 _max_model_len: int | None = None
 _engine_lock = asyncio.Lock()
@@ -227,13 +231,68 @@ async def handler(job):
 	}
 
 # ---------------------------------------------------------------------------
+# Dynamic concurrency — driven by vLLM's KV-cache analysis log line
+# ---------------------------------------------------------------------------
+
+class _VllmConcurrencyCapture(logging.Handler):
+	"""
+	Intercepts the vLLM log line emitted by kv_cache_utils.py:
+
+	    Maximum concurrency for 40,960 tokens per request: 4.55x
+
+	The multiplier (e.g. 4.55) reflects how many simultaneous requests
+	the GPU's KV-cache can hold at the configured token budget.  We floor
+	it to an int and store it in _detected_concurrency so that
+	concurrency_modifier() can return it to RunPod on every poll.
+	"""
+
+	_PATTERN = re.compile(
+		r'Maximum concurrency for [\d,]+ tokens per request:\s+([\d.]+)x'
+	)
+
+	def emit(self, record: logging.LogRecord) -> None:
+		global _detected_concurrency
+		m = self._PATTERN.search(record.getMessage())
+		if m:
+			raw = float(m.group(1))
+			_detected_concurrency = max(1, math.floor(raw))
+			print(
+				f'[concurrency] vLLM KV-cache reports {raw}x max concurrency '
+				f'→ RunPod concurrency set to {_detected_concurrency}'
+			)
+
+def _install_concurrency_capture() -> None:
+	"""
+	Attach _VllmConcurrencyCapture to the root logger so it intercepts
+	every log record regardless of which vLLM sub-logger emitted it.
+	Called once before runpod.serverless.start().
+	"""
+	handler = _VllmConcurrencyCapture(level=logging.INFO)
+	logging.getLogger().addHandler(handler)
+
+def concurrency_modifier(current_concurrency: int) -> int:
+	"""
+	RunPod calls this function periodically to ask how many concurrent
+	jobs this worker should accept.
+
+	Returns the GPU-derived value once vLLM's KV-cache analysis has run
+	(emitted during engine initialisation), otherwise falls back to the
+	MAX_CONCURRENCY environment variable.
+	"""
+	return _detected_concurrency if _detected_concurrency is not None else MAX_CONCURRENCY
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+	# Start intercepting vLLM logs before the engine is created so we
+	# don't miss the KV-cache concurrency line emitted at startup.
+	_install_concurrency_capture()
+	
 	runpod.serverless.start({
 		"handler": handler,
-		"concurrency_modifier": lambda x: MAX_CONCURRENCY,
+		"concurrency_modifier": concurrency_modifier,
 		# Aggregate all yielded chunks so callers receive a single JSON response
 		# rather than a raw newline-delimited stream.
 		"return_aggregate_stream": True,
