@@ -65,7 +65,7 @@ async def get_engine() -> tuple[AsyncLLMEngine, int]:
 		)
 
 		_engine = AsyncLLMEngine.from_engine_args(engine_args)
-		_max_model_len = _engine.llm_engine.model_config.max_model_len
+		_max_model_len = _engine.model_config.max_model_len
 
 		print(f"[init] Engine ready — model={MODEL_NAME}  max_model_len={_max_model_len}")
 
