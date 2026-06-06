@@ -3,6 +3,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import asyncio
 import uuid
@@ -235,72 +236,79 @@ async def handler(job):
 # Dynamic concurrency — driven by vLLM's KV-cache analysis log line
 # ---------------------------------------------------------------------------
 
-class _StreamCapture:
+# Compiled once at module level — used by the relay thread
+_CONCURRENCY_PATTERN = re.compile(
+	r'Maximum concurrency for [\d,]+ tokens per request:\s+([\d.]+)x'
+)
+
+class _FdCapture:
 	"""
-	Stream wrapper that intercepts vLLM's KV-cache concurrency log line:
+	Intercepts a raw file descriptor (stdout=1, stderr=2) at the OS level.
 
-	    (EngineCore pid=N) INFO ... Maximum concurrency for 40,960 tokens per request: 4.55x
+	Why fd-level and not sys.stdout / logging.Handler?
+	- vLLM v1 runs its EngineCore in a forked subprocess (pid differs from
+	  the main process).
+	- On fork the child inherits the parent's raw file descriptors, so it
+	  writes directly to fd 1 — without touching the parent's Python
+	  sys.stdout object or the logging module at all.
+	- The only way to see that output in the parent is to redirect the fd
+	  itself to a pipe *before* the fork, then relay the bytes in a thread.
 
-	Why not a logging.Handler?
-	The log line originates in vLLM's EngineCore *subprocess* (note the
-	'pid=N' prefix).  vLLM forwards those records to the main process and
-	prints them directly to stdout, bypassing Python's logging module
-	entirely.  Wrapping the stream itself is the only reliable interception
-	point that works regardless of vLLM's internal logger propagation
-	settings or which process emitted the text.
+	How it works:
+	  1. os.dup(target_fd)        → save a copy of the original fd
+	  2. os.pipe()                → create (read_fd, write_fd)
+	  3. os.dup2(write_fd, fd)    → fd now points at the write end
+	  4. daemon thread reads from read_fd, forwards to saved_fd, scans lines
 	"""
 
-	_PATTERN = re.compile(
-		r'Maximum concurrency for [\d,]+ tokens per request:\s+([\d.]+)x'
-	)
+	def __init__(self, target_fd: int) -> None:
+		self._saved_fd = os.dup(target_fd)   # preserve the real destination
+		read_fd, write_fd = os.pipe()
+		os.dup2(write_fd, target_fd)         # redirect fd → pipe write-end
+		os.close(write_fd)                   # parent no longer needs this end
+		self._read_fd = read_fd
+		threading.Thread(
+			target=self._relay,
+			daemon=True,
+			name=f'fd{target_fd}-capture',
+		).start()
 
-	def __init__(self, stream):
-		self._stream = stream
-		self._buf = ''  # accumulates text until a newline arrives
+	def _relay(self) -> None:
+		"""Read from pipe, forward verbatim, scan each line for the pattern."""
+		buf = b''
+		while True:
+			try:
+				chunk = os.read(self._read_fd, 4096)
+			except OSError:
+				break
+			if not chunk:
+				break
+			os.write(self._saved_fd, chunk)   # pass through to real destination
+			buf += chunk
+			while b'\n' in buf:
+				line, buf = buf.split(b'\n', 1)
+				self._check(line.decode('utf-8', errors='replace'))
 
-	def write(self, text: str) -> int:
-		n = self._stream.write(text)
-		self._buf += text
-		# Scan only complete lines so a split write never misses the pattern
-		if '\n' in self._buf:
-			*lines, self._buf = self._buf.split('\n')
-			for line in lines:
-				self._scan(line)
-		return n
-
-	def _scan(self, line: str) -> None:
+	def _check(self, line: str) -> None:
 		global _detected_concurrency
-		m = self._PATTERN.search(line)
+		m = _CONCURRENCY_PATTERN.search(line)
 		if m:
 			raw = float(m.group(1))
 			_detected_concurrency = max(1, math.floor(raw))
-			self._stream.write(
-				f'[concurrency] vLLM KV-cache reports {raw}x max '
-				f'→ RunPod concurrency set to {_detected_concurrency}\n'
+			os.write(
+				self._saved_fd,
+				(f'[concurrency] vLLM KV-cache reports {raw}x max '
+					f'→ RunPod concurrency set to {_detected_concurrency}\n').encode(),
 			)
-			self._stream.flush()
-
-	def flush(self) -> None:
-		self._stream.flush()
-
-	def fileno(self) -> int:
-		# Required for subprocess / low-level I/O that checks the fd
-		return self._stream.fileno()
-
-	def __getattr__(self, name: str):
-		# Proxy everything else (encoding, isatty, etc.) to the real stream
-		return getattr(self._stream, name)
 
 def _install_concurrency_capture() -> None:
 	"""
-	Redirect sys.stdout and sys.stderr through _StreamCapture.
-	Called once before runpod.serverless.start() so the wrapper is in
-	place before the engine is initialised on the first job.
+	Redirect stdout (fd 1) and stderr (fd 2) through _FdCapture pipes.
+	Must be called before the vLLM engine is created (i.e. before the
+	EngineCore subprocess is forked) so it inherits the redirected fds.
 	"""
-	if not isinstance(sys.stdout, _StreamCapture):
-		sys.stdout = _StreamCapture(sys.stdout)
-	if not isinstance(sys.stderr, _StreamCapture):
-		sys.stderr = _StreamCapture(sys.stderr)
+	_FdCapture(1)  # stdout
+	_FdCapture(2)  # stderr
 
 def concurrency_modifier(current_concurrency: int) -> int:
 	"""
