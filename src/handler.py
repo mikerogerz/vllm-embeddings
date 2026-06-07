@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 import asyncio
 import uuid
@@ -234,44 +235,58 @@ async def handler(job):
 # Dynamic concurrency — driven by vLLM's KV-cache analysis log line
 # ---------------------------------------------------------------------------
 
-class _VllmLogCapture(logging.Handler):
+_CONCURRENCY_PATTERN = re.compile(
+	r'Maximum concurrency for [\d,]+ tokens per request:\s+([\d.]+)x'
+)
+
+class _FdCapture:
 	"""
-	Captures the vLLM KV-cache concurrency log line via Python's logging system.
+	Redirects stdout (fd 1) through a pipe and relays it in a daemon thread,
+	scanning each line for the vLLM KV-cache concurrency value.
 
-	Why not root logger / sys.stdout / fd-level?
-	- vLLM configures its logger with propagate=False, so root never sees it.
-	- The "vllm" StreamHandler caches the sys.stdout reference at dictConfig
-	  time, so wrapping sys.stdout after import has no effect.
-	- The EngineCore subprocess *does* forward records to the parent via IPC;
-	  the parent re-emits them through the "vllm" logger — so adding our
-	  handler directly there is sufficient and far simpler than fd interception.
+	The EngineCore subprocess writes directly to the inherited fd 1 — it does
+	not forward records through the parent's Python logging system. This rules
+	out logging.Handler (any logger), sys.stdout wrapping (StreamHandler caches
+	the reference at dictConfig time), and logging.Handler on "vllm" (records
+	never arrive there from the subprocess). Redirecting the raw fd before the
+	fork is the only interception point that reliably captures the output.
 	"""
 
-	_PATTERN = re.compile(
-		r'Maximum concurrency for [\d,]+ tokens per request:\s+([\d.]+)x'
-	)
+	def __init__(self, target_fd: int) -> None:
+		read_fd, write_fd = os.pipe()
+		self._out = open(os.dup(target_fd), 'wb', buffering=0)
+		os.dup2(write_fd, target_fd)
+		os.close(write_fd)
+		threading.Thread(
+			target=self._relay,
+			args=(open(read_fd, 'r', encoding='utf-8', errors='replace'),),
+			daemon=True,
+			name=f'fd{target_fd}-capture',
+		).start()
 
-	def emit(self, record: logging.LogRecord) -> None:
+	def _relay(self, pipe) -> None:
+		for line in pipe:
+			self._out.write(line.encode())
+			m = _CONCURRENCY_PATTERN.search(line)
+			if m:
+				self._on_match(float(m.group(1)))
+
+	def _on_match(self, raw: float) -> None:
 		global _detected_concurrency
-		m = self._PATTERN.search(record.getMessage())
-		if m:
-			raw = float(m.group(1))
-			_detected_concurrency = max(1, math.floor(raw))
-			print(
-				f'[concurrency] vLLM KV-cache reports {raw}x '
-				f'→ RunPod concurrency = {_detected_concurrency}'
-			)
+		_detected_concurrency = max(1, math.floor(raw))
+		self._out.write(
+			f'[concurrency] vLLM KV-cache reports {raw}x '
+			f'→ RunPod concurrency = {_detected_concurrency}\n'
+			.encode()
+		)
 
 def _install_concurrency_capture() -> None:
 	"""
-	Add _VllmLogCapture to the "vllm" logger.
-
-	vLLM's dictConfig runs on import (propagate=False, handler → sys.stdout).
-	Calling this after the import but before runpod.serverless.start() means
-	our handler is appended after dictConfig and stays in place for the
-	engine-init log line emitted during the first job's get_engine() call.
+	Redirect stdout (fd 1) through _FdCapture before runpod.serverless.start().
+	The EngineCore subprocess is forked during the first get_engine() call, so
+	installing here ensures it inherits the redirected fd.
 	"""
-	logging.getLogger("vllm").addHandler(_VllmLogCapture())
+	_FdCapture(1)
 
 def concurrency_modifier(current_concurrency: int) -> int:
 	"""
