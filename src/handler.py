@@ -111,7 +111,7 @@ async def embed_text(
 	if final_output is None:
 		raise RuntimeError(f"Engine returned no output for request '{request_id}'")
 
-	return final_output.outputs.data.tolist()
+	return final_output.outputs.data.flatten().tolist()
 
 # ---------------------------------------------------------------------------
 # Encoding helpers
