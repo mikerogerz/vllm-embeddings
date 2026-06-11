@@ -39,15 +39,13 @@ _max_model_len: int | None = None
 _engine_lock = asyncio.Lock()
 
 async def get_engine() -> tuple[AsyncLLM, int]:
-	"""Initialise AsyncLLMEngine once; subsequent calls return the cached instance."""
+	"""Initialise AsyncLLM once; subsequent calls return the cached instance."""
 	global _engine, _max_model_len
 
-	# Fast path – engine already ready
 	if _engine is not None:
 		return _engine, _max_model_len
 
 	async with _engine_lock:
-		# Second check inside the lock to guard against simultaneous initialisers
 		if _engine is not None:
 			return _engine, _max_model_len
 
@@ -89,12 +87,14 @@ async def embed_text(
 	truncate_len: int,
 ) -> list[float]:
 	"""
-	Embed a single piece of text.
+	Embed a single text string.
 
-	vLLM's AsyncLLMEngine.encode() is itself an async generator that yields
-	incremental EmbeddingRequestOutput objects as the request progresses through
-	the engine's continuous batching loop.  We drain the generator and keep only
-	the final output, which contains the complete embedding vector.
+	Texts are embedded one at a time so each encode() call sees exactly one
+	input. When asyncio.gather is used to fan out N concurrent encode() calls,
+	vLLM batches them in a single forward pass and returns the full [N, dim]
+	matrix in outputs.data for every request — flattening that gives N×dim
+	values instead of dim. Sequential-per-text avoids this entirely; GPU
+	batching still occurs across concurrent RunPod jobs.
 	"""
 	pooling_params = PoolingParams()
 	final_output = None
@@ -105,7 +105,6 @@ async def embed_text(
 		request_id=request_id,
 		tokenization_kwargs=dict(truncate_prompt_tokens=truncate_len),
 	):
-		# Each iteration may be a partial/intermediate result; overwrite until done
 		final_output = output
 
 	if final_output is None:
@@ -124,54 +123,38 @@ def to_base64(embedding: list[float]) -> str:
 	).decode("utf-8")
 
 # ---------------------------------------------------------------------------
-# RunPod handler  (async generator → enables streaming + concurrent jobs)
+# RunPod handler
 # ---------------------------------------------------------------------------
 
 async def handler(job):
 	"""
-	RunPod serverless handler.
-
-	Declaring this as an async generator (uses `yield`) lets RunPod:
-	  • run multiple jobs concurrently within the same worker process, and
-	  • stream partial results back to callers when appropriate.
-
-	For embedding workloads we yield once with the complete response; the
-	concurrent-request benefit comes from AsyncLLMEngine batching all
-	per-text encode() calls that arrive during the same scheduling window.
+	Plain async handler (not a generator) so RunPod returns 'output' as a
+	single object rather than wrapping each yield in an array.
 	"""
 	job_input = job["input"]
 	prompt    = job_input.get("prompt")
-
-	# ---- Input validation ----
 
 	if isinstance(prompt, str):
 		texts = [prompt]
 	elif isinstance(prompt, list):
 		texts = prompt
 	else:
-		yield {"error": "'prompt' must be a string or list of strings"}
-		return
+		return {"error": "'prompt' must be a string or list of strings"}
 
 	if not texts:
-		yield {"error": "Empty input"}
-		return
+		return {"error": "Empty input"}
 
 	if not all(isinstance(t, str) for t in texts):
-		yield {"error": "All items in 'prompt' must be strings"}
-		return
+		return {"error": "All items in 'prompt' must be strings"}
 
 	encoding_format = job_input.get("encoding_format", "float")
 	if encoding_format not in ("float", "base64"):
-		yield {"error": "encoding_format must be 'float' or 'base64'"}
-		return
-
-	# ---- Engine init (idempotent) ----
+		return {"error": "encoding_format must be 'float' or 'base64'"}
 
 	try:
 		engine, max_model_len = await get_engine()
 	except Exception as exc:
-		yield {"error": f"Engine initialisation failed: {exc}"}
-		return
+		return {"error": f"Engine initialisation failed: {exc}"}
 
 	truncate_len = max_model_len - 1
 	job_id = job.get("id", str(uuid.uuid4()))
@@ -183,27 +166,20 @@ async def handler(job):
 		f"avg={sum(text_lengths) // len(text_lengths)}"
 	)
 
-	# ---- Concurrent embedding ----
-	#
-	# asyncio.gather fans out one engine.encode() coroutine per text.
-	# Because AsyncLLMEngine runs a background scheduling loop, all of these
-	# requests are visible to the engine at once and get batched together,
-	# giving true GPU-level concurrency rather than sequential inference.
-
 	start = time.time()
 
+	# Process texts sequentially: each encode() call sees exactly one text,
+	# so outputs.data is always [dim] (never [N, dim]).  Cross-job GPU
+	# batching still occurs via vLLM's continuous batching loop.
+	embeddings: list[list[float]] = []
 	try:
-		embeddings: list[list[float]] = await asyncio.gather(*[
-			embed_text(engine, text, f"{job_id}-{i}", truncate_len)
-			for i, text in enumerate(texts)
-		])
+		for i, text in enumerate(texts):
+			emb = await embed_text(engine, text, f"{job_id}-{i}", truncate_len)
+			embeddings.append(emb)
 	except Exception as exc:
-		yield {"error": f"Embedding failed: {exc}"}
-		return
+		return {"error": f"Embedding failed: {exc}"}
 
 	elapsed = time.time() - start
-
-	# ---- Build response ----
 
 	data = [
 		{
@@ -221,7 +197,7 @@ async def handler(job):
 		f"({elapsed / len(embeddings):.3f}s avg)"
 	)
 
-	yield {
+	return {
 		"object": "list",
 		"data": data,
 		"model": MODEL_NAME,
@@ -290,12 +266,9 @@ def _install_concurrency_capture() -> None:
 
 def concurrency_modifier(current_concurrency: int) -> int:
 	"""
-	RunPod calls this function periodically to ask how many concurrent
-	jobs this worker should accept.
-
-	Returns the GPU-derived value once vLLM's KV-cache analysis has run
-	(emitted during engine initialisation), otherwise falls back to the
-	MAX_CONCURRENCY environment variable.
+	RunPod calls this periodically to ask how many concurrent jobs this worker
+	should accept. Returns the GPU-derived value once vLLM's KV-cache analysis
+	has run, otherwise falls back to the MAX_CONCURRENCY environment variable.
 	"""
 	return _detected_concurrency if _detected_concurrency is not None else MAX_CONCURRENCY
 
@@ -311,7 +284,4 @@ if __name__ == "__main__":
 	runpod.serverless.start({
 		"handler": handler,
 		"concurrency_modifier": concurrency_modifier,
-		# Aggregate all yielded chunks so callers receive a single JSON response
-		# rather than a raw newline-delimited stream.
-		"return_aggregate_stream": True,
 	})
