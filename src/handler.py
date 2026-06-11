@@ -110,7 +110,12 @@ async def embed_text(
 	if final_output is None:
 		raise RuntimeError(f"Engine returned no output for request '{request_id}'")
 
-	return final_output.outputs.data.flatten().tolist()
+	data = final_output.outputs.data
+	# outputs.data accumulates across requests: the Nth call returns [N, dim].
+	# The current request's embedding is always the last row.
+	if hasattr(data, 'ndim') and data.ndim > 1:
+		data = data[-1]
+	return data.tolist()
 
 # ---------------------------------------------------------------------------
 # Encoding helpers
