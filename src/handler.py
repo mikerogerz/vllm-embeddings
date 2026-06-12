@@ -130,9 +130,14 @@ async def _embed_worker(engine: AsyncLLM, max_model_len: int) -> None:
 				raise RuntimeError(f"Engine returned no output for '{request_id}'")
 
 			data = final_output.outputs.data
-			# N == 1 guaranteed by this worker being the sole encode() caller.
+			# outputs.data is cumulative: the Nth call returns [N, dim], where
+			# each row is the result of a past encode() call in submission order.
+			# data[0] always returns the very first embedding ever computed.
+			# data[-1] is always the most recently computed — i.e. this call.
+			# The worker's sequential execution guarantees no other encode() can
+			# append a row between our call completing and this extraction.
 			if hasattr(data, 'ndim') and data.ndim > 1:
-				data = data[0]
+				data = data[-1]
 			future.set_result(data.tolist())
 
 		except Exception as exc:
