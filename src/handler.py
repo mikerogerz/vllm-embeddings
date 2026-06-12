@@ -38,9 +38,12 @@ _engine: AsyncLLM | None = None
 _max_model_len: int | None = None
 _engine_lock = asyncio.Lock()
 
+# Queue-based embedding serialisation — see _embed_worker / embed_text.
+_embed_queue: asyncio.Queue | None = None
+
 async def get_engine() -> tuple[AsyncLLM, int]:
 	"""Initialise AsyncLLM once; subsequent calls return the cached instance."""
-	global _engine, _max_model_len
+	global _engine, _max_model_len, _embed_queue
 
 	if _engine is not None:
 		return _engine, _max_model_len
@@ -72,50 +75,81 @@ async def get_engine() -> tuple[AsyncLLM, int]:
 		_engine = AsyncLLM.from_engine_args(engine_args)
 		_max_model_len = _engine.model_config.max_model_len
 
+		# Start the single embed worker now that the engine is ready.
+		_embed_queue = asyncio.Queue()
+		asyncio.create_task(
+			_embed_worker(_engine, _max_model_len),
+			name="embed-worker",
+		)
+
 		print(f"[init] Engine ready — model={MODEL_NAME}  max_model_len={_max_model_len}")
 
 	return _engine, _max_model_len
 
 # ---------------------------------------------------------------------------
-# Per-text embedding helper
+# Embed worker + per-text helper
 # ---------------------------------------------------------------------------
 
-async def embed_text(
-	engine: AsyncLLM,
-	text: str,
-	request_id: str,
-	truncate_len: int,
-) -> list[float]:
+async def _embed_worker(engine: AsyncLLM, max_model_len: int) -> None:
 	"""
-	Embed a single text string.
+	Single background task that is the sole caller of engine.encode().
 
-	Texts are embedded one at a time so each encode() call sees exactly one
-	input. When asyncio.gather is used to fan out N concurrent encode() calls,
-	vLLM batches them in a single forward pass and returns the full [N, dim]
-	matrix in outputs.data for every request — flattening that gives N×dim
-	values instead of dim. Sequential-per-text avoids this entirely; GPU
-	batching still occurs across concurrent RunPod jobs.
+	Why a worker instead of a lock?
+	vLLM returns outputs.data as [N, dim] for however many requests landed in
+	the same engine batch — there is no field identifying which row belongs to
+	which request_id.  By funnelling all encode() calls through this one task
+	we guarantee N == 1 on every call, so data[0] is always unambiguous.
+
+	Concurrent RunPod jobs post (text, request_id, Future) tuples to
+	_embed_queue and await their Futures.  The worker drains the queue
+	sequentially, resolving each Future with the correct embedding.  Jobs
+	remain concurrent for all non-GPU work (validation, I/O, response
+	serialisation); only the encode() call itself is serialised.
+
+	When vLLM fixes outputs.data to return [dim] per request rather than
+	[N, dim] for the whole batch, this worker can be removed and embed_text
+	can call encode() directly without any serialisation.
 	"""
-	pooling_params = PoolingParams()
-	final_output = None
+	truncate_len = max_model_len - 1
 
-	async for output in engine.encode(
-		TextPrompt(prompt=text),
-		pooling_params=pooling_params,
-		request_id=request_id,
-		tokenization_kwargs=dict(truncate_prompt_tokens=truncate_len),
-	):
-		final_output = output
+	while True:
+		text, request_id, future = await _embed_queue.get()
+		try:
+			pooling_params = PoolingParams()
+			final_output = None
 
-	if final_output is None:
-		raise RuntimeError(f"Engine returned no output for request '{request_id}'")
+			async for output in engine.encode(
+				TextPrompt(prompt=text),
+				pooling_params=pooling_params,
+				request_id=request_id,
+				tokenization_kwargs=dict(truncate_prompt_tokens=truncate_len),
+			):
+				final_output = output
 
-	data = final_output.outputs.data
-	# outputs.data accumulates across requests: the Nth call returns [N, dim].
-	# The current request's embedding is always the last row.
-	if hasattr(data, 'ndim') and data.ndim > 1:
-		data = data[-1]
-	return data.tolist()
+			if final_output is None:
+				raise RuntimeError(f"Engine returned no output for '{request_id}'")
+
+			data = final_output.outputs.data
+			# N == 1 guaranteed by this worker being the sole encode() caller.
+			if hasattr(data, 'ndim') and data.ndim > 1:
+				data = data[0]
+			future.set_result(data.tolist())
+
+		except Exception as exc:
+			if not future.done():
+				future.set_exception(exc)
+
+async def embed_text(text: str, request_id: str) -> list[float]:
+	"""
+	Post a single text to the embed worker and await its result.
+
+	The caller does not need the engine or truncate_len — those are owned by
+	the worker.  Multiple callers (from concurrent jobs or asyncio.gather)
+	can post simultaneously; the worker processes them one at a time.
+	"""
+	future: asyncio.Future = asyncio.get_event_loop().create_future()
+	await _embed_queue.put((text, request_id, future))
+	return await future
 
 # ---------------------------------------------------------------------------
 # Encoding helpers
@@ -133,8 +167,12 @@ def to_base64(embedding: list[float]) -> str:
 
 async def handler(job):
 	"""
-	Plain async handler (not a generator) so RunPod returns 'output' as a
-	single object rather than wrapping each yield in an array.
+	Plain async handler — RunPod returns 'output' as a single object.
+
+	Validation and I/O run concurrently across jobs.  asyncio.gather fans
+	out embed_text calls within a job so all texts are queued simultaneously;
+	the embed worker processes them sequentially and resolves each Future
+	independently.
 	"""
 	job_input = job["input"]
 	prompt    = job_input.get("prompt")
@@ -157,11 +195,10 @@ async def handler(job):
 		return {"error": "encoding_format must be 'float' or 'base64'"}
 
 	try:
-		engine, max_model_len = await get_engine()
+		await get_engine() # idempotent; starts embed worker on first call
 	except Exception as exc:
 		return {"error": f"Engine initialisation failed: {exc}"}
 
-	truncate_len = max_model_len - 1
 	job_id = job.get("id", str(uuid.uuid4()))
 
 	text_lengths = [len(t) for t in texts]
@@ -173,14 +210,13 @@ async def handler(job):
 
 	start = time.time()
 
-	# Process texts sequentially: each encode() call sees exactly one text,
-	# so outputs.data is always [dim] (never [N, dim]).  Cross-job GPU
-	# batching still occurs via vLLM's continuous batching loop.
-	embeddings: list[list[float]] = []
 	try:
-		for i, text in enumerate(texts):
-			emb = await embed_text(engine, text, f"{job_id}-{i}", truncate_len)
-			embeddings.append(emb)
+		# asyncio.gather queues all texts simultaneously — the embed worker
+		# processes them one at a time and returns each result via its Future.
+		embeddings: list[list[float]] = await asyncio.gather(*[
+			embed_text(text, f"{job_id}-{i}")
+			for i, text in enumerate(texts)
+		])
 	except Exception as exc:
 		return {"error": f"Embedding failed: {exc}"}
 
