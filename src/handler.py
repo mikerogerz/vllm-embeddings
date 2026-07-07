@@ -7,6 +7,7 @@ import asyncio
 import uuid
 import base64
 import struct
+import torch
 import runpod
 
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -27,8 +28,6 @@ MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", 5))
 ENABLE_CHUNKED_PROCESSING = os.environ.get("ENABLE_CHUNKED_PROCESSING", "true").lower() == "true"
 MAX_EMBED_LEN = int(os.environ.get("MAX_EMBED_LEN", "3072000"))
 POOLING_TYPE = os.environ.get("POOLING_TYPE", "LAST")
-# Print the raw embedding tensor shape for the first request, to confirm the
-# extraction assumption against the actual model/vLLM build in production.
 EMBED_DEBUG = os.environ.get("EMBED_DEBUG", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
@@ -39,19 +38,20 @@ _detected_concurrency: int | None = None # set from vLLM's KV-cache log line
 _engine: AsyncLLM | None = None
 _max_model_len: int | None = None
 _engine_lock = asyncio.Lock()
-
-# Single-consumer queue that serialises encode() — see _embed_worker.
-_embed_queue: asyncio.Queue | None = None
 _debug_logged = False
 
 async def get_engine() -> tuple[AsyncLLM, int]:
 	"""Initialise AsyncLLM once; subsequent calls return the cached instance."""
-	global _engine, _max_model_len, _embed_queue
+	global _engine, _max_model_len
 
 	if _engine is not None:
 		return _engine, _max_model_len
 
 	async with _engine_lock:
+		# Second check inside the lock guards against simultaneous initialisers.
+		# This lock ONLY protects one-time engine construction — it does not
+		# wrap encode(). Embedding requests run fully concurrently: each request
+		# returns its own text's data, independent of every other request.
 		if _engine is not None:
 			return _engine, _max_model_len
 
@@ -78,12 +78,6 @@ async def get_engine() -> tuple[AsyncLLM, int]:
 		_engine = AsyncLLM.from_engine_args(engine_args)
 		_max_model_len = _engine.model_config.max_model_len
 
-		_embed_queue = asyncio.Queue()
-		asyncio.create_task(
-			_embed_worker(_engine, _max_model_len),
-			name="embed-worker",
-		)
-
 		print(f"[init] Engine ready — model={MODEL_NAME}  max_model_len={_max_model_len}")
 
 	return _engine, _max_model_len
@@ -94,101 +88,83 @@ async def get_engine() -> tuple[AsyncLLM, int]:
 
 def _extract_embedding(output, request_id: str) -> list[float]:
 	"""
-	Extract this request's embedding from a PoolingRequestOutput.
+	Extract the sequence embedding for a single request and L2-normalize it.
 
-	IMPORTANT — why this is only valid when encode() is serialised:
-	In this vLLM build, outputs.data holds the pooled vectors for the ENTIRE
-	engine batch, shaped [batch_size, hidden], with no field on the output
-	identifying which row belongs to which request_id. Empirically, running
-	two texts concurrently produced shape [2, 4096] on a single request.
-	There is therefore no safe way to pick "our" row while other requests
-	share the batch.
+	Field choice:
+	  • output.outputs.embedding — the POOLED sequence vector [hidden]. This is
+	    what vLLM's embed task produces: last-[EOS]-token pooling + normalization,
+	    which is exactly Qwen3-Embedding's contract. Prefer this.
+	  • output.outputs.data — the RAW pooler data. For Qwen3-Embedding this is
+	    per-token hidden states [num_tokens, hidden] (that is why earlier debug
+	    showed 2 / 4 / 14 rows = token counts, NOT batches). Only used as a
+	    fallback; we take the last token (LAST pooling) to match the model.
 
-	The embed worker guarantees exactly one request is in flight at a time, so
-	batch_size is always 1 and the shape is [1, hidden] (or [hidden]). Row 0 is
-	then unambiguously this request's embedding.
-
-	If more than one row appears despite serialisation, it means a single text
-	produced multiple vectors (e.g. chunked long-text processing that wasn't
-	internally aggregated). Mean-pooling across the rows is the standard
-	aggregation for multi-chunk document embeddings.
+	L2 normalization is applied unconditionally. Qwen3-Embedding embeddings are
+	unit vectors; Meilisearch compares them with angular/cosine distance and
+	rejects inconsistent (non-normalized) vectors. Re-normalizing an already
+	unit vector is a harmless no-op, so applying it to both paths guarantees
+	stable, comparable output regardless of which field was used.
 	"""
 	global _debug_logged
+	o = output.outputs
 
-	data = output.outputs.data
+	emb = getattr(o, "embedding", None)
+	if emb is not None:
+		if EMBED_DEBUG and not _debug_logged:
+			print(f"[debug] request {request_id}: using outputs.embedding (len={len(emb)})")
+			_debug_logged = True
+		vec = torch.as_tensor(emb, dtype=torch.float32)
+	else:
+		data = o.data
+		if EMBED_DEBUG and not _debug_logged:
+			shape = getattr(data, "shape", f"(type={type(data).__name__})")
+			print(f"[debug] request {request_id}: outputs.embedding absent; "
+			      f"using outputs.data shape={shape} (last-token pooling)")
+			_debug_logged = True
+		if hasattr(data, "ndim"):
+			vec = data if data.ndim == 1 else data[-1]  # LAST token
+			vec = vec.to(torch.float32)
+		else:
+			# plain list / list-of-lists
+			row = data[-1] if (data and isinstance(data[0], (list, tuple))) else data
+			vec = torch.as_tensor(list(row), dtype=torch.float32)
 
-	if EMBED_DEBUG and not _debug_logged:
-		shape = getattr(data, "shape", f"(no shape, type={type(data).__name__})")
-		print(f"[debug] request {request_id}: outputs.data shape = {shape}")
-		_debug_logged = True
-
-	if hasattr(data, "ndim"):
-		if data.ndim == 1:
-			return data.tolist()
-		if data.shape[0] == 1:
-			return data[0].tolist()
-		# Multiple rows under serialisation → chunks of one text → mean-pool.
-		print(
-			f"[warn] request {request_id}: {data.shape[0]} rows for one text; "
-			f"mean-pooling as chunk aggregation"
-		)
-		return data.mean(dim=0).tolist()
-
-	# Fallbacks for list / other sequence types
-	if data and isinstance(data[0], (list, tuple)):
-		if len(data) == 1:
-			return list(data[0])
-		cols = list(zip(*data))
-		return [sum(c) / len(c) for c in cols]
-	return list(data)
+	vec = torch.nn.functional.normalize(vec, p=2, dim=-1)
+	return vec.tolist()
 
 # ---------------------------------------------------------------------------
-# Embed worker — sole caller of engine.encode()
+# Per-text embedding helper
 # ---------------------------------------------------------------------------
 
-async def _embed_worker(engine: AsyncLLM, max_model_len: int) -> None:
+async def embed_text(
+	engine: AsyncLLM,
+	text: str,
+	request_id: str,
+	truncate_len: int,
+) -> list[float]:
 	"""
-	Single background task that owns every encode() call.
+	Embed a single text via its own encode() request.
 
-	This is what guarantees batch_size == 1: by draining each request fully
-	before pulling the next off the queue, only one request is ever active in
-	the engine, so outputs.data is always [1, hidden] and _extract_embedding
-	can trust row 0. Concurrent RunPod jobs post (text, id, Future) tuples and
-	await their Futures; all their non-GPU work still runs concurrently.
+	encode() is an async generator keyed to request_id; each request's output
+	carries only that request's data, so concurrent calls (via asyncio.gather
+	or across concurrent RunPod jobs) are safe. vLLM's continuous batching packs
+	them into shared GPU passes — this is what concurrency_modifier exploits.
 	"""
-	truncate_len = max_model_len - 1
+	pooling_params = PoolingParams()
+	final_output = None
 
-	while True:
-		text, request_id, future = await _embed_queue.get()
-		try:
-			pooling_params = PoolingParams()
-			final_output = None
+	async for output in engine.encode(
+		TextPrompt(prompt=text),
+		pooling_params=pooling_params,
+		request_id=request_id,
+		tokenization_kwargs=dict(truncate_prompt_tokens=truncate_len),
+	):
+		final_output = output
 
-			async for output in engine.encode(
-				TextPrompt(prompt=text),
-				pooling_params=pooling_params,
-				request_id=request_id,
-				tokenization_kwargs=dict(truncate_prompt_tokens=truncate_len),
-			):
-				final_output = output
+	if final_output is None:
+		raise RuntimeError(f"Engine returned no output for request '{request_id}'")
 
-			if final_output is None:
-				raise RuntimeError(f"Engine returned no output for '{request_id}'")
-
-			if not future.done():
-				future.set_result(_extract_embedding(final_output, request_id))
-
-		except Exception as exc:
-			if not future.done():
-				future.set_exception(exc)
-		finally:
-			_embed_queue.task_done()
-
-async def embed_text(text: str, request_id: str) -> list[float]:
-	"""Post one text to the embed worker and await its embedding."""
-	future: asyncio.Future = asyncio.get_event_loop().create_future()
-	await _embed_queue.put((text, request_id, future))
-	return await future
+	return _extract_embedding(final_output, request_id)
 
 # ---------------------------------------------------------------------------
 # Encoding helpers
@@ -208,10 +184,10 @@ async def handler(job):
 	"""
 	Plain async handler — RunPod returns 'output' as a single object.
 
-	Jobs are accepted concurrently (concurrency_modifier > 1) and all their
-	validation / I/O / response building overlaps. The GPU encode() step is
-	serialised through the embed worker because this vLLM build's pooling
-	output does not expose per-request rows within a shared batch.
+	Jobs run concurrently (concurrency_modifier > 1); within a job asyncio.gather
+	fans out one encode() per text. Every request is independent, so no lock or
+	serialising worker is needed — the earlier "shared batch" theory was a
+	misread of per-token output.
 	"""
 	job_input = job["input"]
 	prompt    = job_input.get("prompt")
@@ -234,11 +210,12 @@ async def handler(job):
 		return {"error": "encoding_format must be 'float' or 'base64'"}
 
 	try:
-		await get_engine()  # idempotent; starts the embed worker on first call
+		engine, max_model_len = await get_engine()
 	except Exception as exc:
 		return {"error": f"Engine initialisation failed: {exc}"}
 
-	job_id = job.get("id", uuid.uuid4().hex)
+	truncate_len = max_model_len - 1
+	job_id       = job.get("id", uuid.uuid4().hex)
 
 	text_lengths = [len(t) for t in texts]
 	print(
@@ -249,11 +226,11 @@ async def handler(job):
 
 	start = time.time()
 
-	# gather queues all texts at once; the worker drains them one at a time.
-	# request_ids are globally unique so results never cross-route.
+	# Concurrent embedding: unique request_id per text prevents any output
+	# cross-routing between concurrent requests or concurrent jobs.
 	try:
 		embeddings: list[list[float]] = await asyncio.gather(*[
-			embed_text(text, f"{job_id}-{i}-{uuid.uuid4().hex}")
+			embed_text(engine, text, f"{job_id}-{i}-{uuid.uuid4().hex}", truncate_len)
 			for i, text in enumerate(texts)
 		])
 	except Exception as exc:
@@ -265,7 +242,7 @@ async def handler(job):
 	if len(dims) > 1:
 		return {
 			"error": f"Inconsistent embedding dimensions {sorted(dims)} — "
-			         f"check outputs.data shape (set EMBED_DEBUG=true)"
+			         f"check outputs field (set EMBED_DEBUG=true)"
 		}
 
 	data = [
@@ -357,9 +334,8 @@ def concurrency_modifier(current_concurrency: int) -> int:
 	Returns the GPU-derived value once vLLM's KV-cache analysis has run,
 	otherwise falls back to the MAX_CONCURRENCY environment variable.
 
-	Accepting multiple jobs still helps: their validation, tokenisation of the
-	queue, response encoding and network I/O all overlap. The encode() step
-	itself is serialised by the embed worker (see _extract_embedding for why).
+	encode() now runs concurrently, so accepting multiple jobs lets vLLM batch
+	their requests together on the GPU — the intent behind the KV-cache value.
 	"""
 	return _detected_concurrency if _detected_concurrency is not None else MAX_CONCURRENCY
 
@@ -368,8 +344,6 @@ def concurrency_modifier(current_concurrency: int) -> int:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-	# Start intercepting vLLM logs before the engine is created so we
-	# don't miss the KV-cache concurrency line emitted at startup.
 	_install_concurrency_capture()
 
 	runpod.serverless.start({
