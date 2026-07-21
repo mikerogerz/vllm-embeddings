@@ -10,6 +10,13 @@ import struct
 import torch
 import runpod
 
+# Force offline BEFORE any HF/vLLM import resolves a model. Belt-and-suspenders
+# with the Dockerfile ENV — guarantees no worker ever reaches the Hub, so no
+# cold-starting worker can fall through to a runtime download and race another
+# worker on a half-written cache.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.config import PoolerConfig
 from vllm.inputs import TextPrompt
@@ -20,7 +27,13 @@ from vllm.v1.engine.async_llm import AsyncLLM
 # Configuration
 # ---------------------------------------------------------------------------
 
+# MODEL_NAME is the BARE repo id (no ':hash' / '@hash' suffix); the commit goes
+# in MODEL_REVISION. RunPod's managed cache stores snapshots by hash, so we
+# resolve the hash directly.
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-8B")
+MODEL_REVISION = os.environ.get("MODEL_REVISION") or None
+# RunPod managed model-cache root (matches HF_HOME/hub from the Dockerfile).
+HF_CACHE_ROOT = os.environ.get("HF_CACHE_ROOT", "/runpod-volume/huggingface-cache/hub")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
 TRUST_REMOTE_CODE = os.environ.get("TRUST_REMOTE_CODE", "False").lower() == "true"
@@ -29,6 +42,72 @@ ENABLE_CHUNKED_PROCESSING = os.environ.get("ENABLE_CHUNKED_PROCESSING", "true").
 MAX_EMBED_LEN = int(os.environ.get("MAX_EMBED_LEN", "3072000"))
 POOLING_TYPE = os.environ.get("POOLING_TYPE", "LAST")
 EMBED_DEBUG = os.environ.get("EMBED_DEBUG", "true").lower() == "true"
+
+# ---------------------------------------------------------------------------
+# Managed-cache snapshot resolution
+# ---------------------------------------------------------------------------
+
+def _list_snapshots(snapshots_dir: str) -> list[str]:
+	if not os.path.isdir(snapshots_dir):
+		return []
+	return sorted(
+		d for d in os.listdir(snapshots_dir)
+		if os.path.isdir(os.path.join(snapshots_dir, d))
+	)
+
+def resolve_snapshot_path(model_id: str, revision: str | None = None) -> str:
+	"""
+	Resolve the local snapshot directory for a model in RunPod's managed cache.
+
+	Order of preference:
+	  1. Exact pinned `revision` — snapshots/<hash>. Deterministic; use whenever
+	     a commit is pinned (the endpoint's Model field records one).
+	  2. Whatever refs/main points at (RunPod caches 'main' when unpinned).
+	  3. The single materialized snapshot, ONLY if exactly one exists.
+
+	Returning an explicit, complete snapshot dir (rather than the bare repo id)
+	is what makes the load deterministic: vLLM does no revision resolution and,
+	with offline forced, never touches the network. Raising with the snapshots
+	actually present turns a sporadic mid-load failure into a legible startup
+	error that tells you whether the Model field cached the commit you expect.
+	"""
+	if "/" not in model_id:
+		raise ValueError(f"model_id '{model_id}' must be in 'org/name' format")
+
+	org, name = model_id.split("/", 1)
+	model_root = os.path.join(HF_CACHE_ROOT, f"models--{org}--{name}")
+	snapshots_dir = os.path.join(model_root, "snapshots")
+
+	# 1) Exact pinned commit.
+	if revision:
+		candidate = os.path.join(snapshots_dir, revision)
+		if os.path.isdir(candidate):
+			return candidate
+		raise RuntimeError(
+			f"Pinned revision '{revision}' of '{model_id}' is NOT in the managed "
+			f"cache. Snapshots present: {_list_snapshots(snapshots_dir)}. Confirm "
+			f"the endpoint's Model field cached this commit and that MODEL_REVISION "
+			f"matches the version hash it recorded."
+		)
+
+	# 2) refs/main.
+	refs_main = os.path.join(model_root, "refs", "main")
+	if os.path.isfile(refs_main):
+		with open(refs_main, "r") as f:
+			snapshot_hash = f.read().strip()
+		candidate = os.path.join(snapshots_dir, snapshot_hash)
+		if os.path.isdir(candidate):
+			return candidate
+
+	# 3) Single snapshot only — never guess between multiple.
+	snaps = _list_snapshots(snapshots_dir)
+	if len(snaps) == 1:
+		return os.path.join(snapshots_dir, snaps[0])
+
+	raise RuntimeError(
+		f"Could not resolve a snapshot for '{model_id}' under {snapshots_dir}. "
+		f"Snapshots present: {snaps}. Set MODEL_REVISION to disambiguate."
+	)
 
 # ---------------------------------------------------------------------------
 # Lazy async engine singleton
@@ -62,8 +141,15 @@ async def get_engine() -> tuple[AsyncLLM, int]:
 			max_embed_len=MAX_EMBED_LEN,
 		)
 
+		# Resolve the exact local snapshot in RunPod's managed cache and hand
+		# vLLM that directory. With offline forced (top of file), the load is
+		# fully deterministic — no revision resolution, no network, no download —
+		# so concurrent cold-starts can't race on a partial cache.
+		local_model_path = resolve_snapshot_path(MODEL_NAME, MODEL_REVISION)
+		print(f"[init] loading from managed cache: {local_model_path}")
+
 		engine_args = AsyncEngineArgs(
-			model=MODEL_NAME,
+			model=local_model_path, # explicit snapshot dir, not the repo id
 			runner="pooling",
 			convert="embed",
 			trust_remote_code=TRUST_REMOTE_CODE,
@@ -71,7 +157,6 @@ async def get_engine() -> tuple[AsyncLLM, int]:
 			enforce_eager=True,
 			enable_prefix_caching=True,
 			gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-			download_dir=DOWNLOAD_DIR,
 			pooler_config=pooler_config,
 		)
 
