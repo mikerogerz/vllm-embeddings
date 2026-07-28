@@ -1,6 +1,6 @@
 FROM vllm/vllm-openai:v0.25.1-cu129-ubuntu2404
 
-RUN uv pip install --system --no-cache-dir "runpod>=1.8,<2.0" huggingface-hub hf-transfer
+RUN uv pip install --system --no-cache-dir "runpod>=1.8,<2.0" huggingface-hub
 
 # MODEL_NAME / MODEL_REVISION are RUNTIME settings — set them on the endpoint
 # (Manage -> Edit Endpoint -> Environment Variables). MODEL_NAME must match the
@@ -28,9 +28,11 @@ ENV HF_HOME="${BASE_PATH}/huggingface-cache"
 # ever falls through to a runtime download, so no cold-starting worker can glob
 # a half-written snapshot. If the model isn't cached, the worker fails fast with
 # a clear offline error instead of silently downloading.
+# Deliberately no transfer-acceleration knob here (neither the deprecated
+# HF_HUB_ENABLE_HF_TRANSFER nor HF_XET_HIGH_PERFORMANCE): with offline forced,
+# nothing is ever downloaded, so there is no transfer to accelerate.
 ENV HF_HUB_OFFLINE=1 \
-	TRANSFORMERS_OFFLINE=1 \
-	HF_HUB_ENABLE_HF_TRANSFER=1
+	TRANSFORMERS_OFFLINE=1
 
 ENV PYTHONPATH="/:/vllm-workspace"
 
