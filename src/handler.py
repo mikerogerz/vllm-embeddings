@@ -1,6 +1,9 @@
 import math
 import os
 import re
+import glob
+import json
+import sys
 import threading
 import time
 import asyncio
@@ -34,6 +37,14 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-Embedding-8B")
 MODEL_REVISION = os.environ.get("MODEL_REVISION") or None
 # RunPod managed model-cache root (matches HF_HOME/hub from the Dockerfile).
 HF_CACHE_ROOT = os.environ.get("HF_CACHE_ROOT", "/runpod-volume/huggingface-cache/hub")
+# How long to wait for an in-progress host cache population to finish before
+# declaring the worker unusable. HF creates snapshots/<hash>/ early and fills
+# it progressively, so a worker can legitimately arrive mid-population.
+CACHE_WAIT_SECONDS = int(os.environ.get("CACHE_WAIT_SECONDS", "180"))
+CACHE_POLL_SECONDS = int(os.environ.get("CACHE_POLL_SECONDS", "5"))
+# Exit the process when the model cannot be loaded, so RunPod replaces this
+# worker instead of leaving it alive returning errors forever.
+EXIT_ON_MODEL_FAILURE = os.environ.get("EXIT_ON_MODEL_FAILURE", "true").lower() == "true"
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
 TRUST_REMOTE_CODE = os.environ.get("TRUST_REMOTE_CODE", "False").lower() == "true"
@@ -54,6 +65,86 @@ def _list_snapshots(snapshots_dir: str) -> list[str]:
 		d for d in os.listdir(snapshots_dir)
 		if os.path.isdir(os.path.join(snapshots_dir, d))
 	)
+
+def validate_snapshot(path: str) -> tuple[bool, str]:
+	"""
+	Verify a snapshot directory actually holds loadable weights.
+
+	Directory existence is NOT enough. HuggingFace creates snapshots/<hash>/
+	early in a download and populates it progressively: blobs land in ../../blobs
+	as *.incomplete files, and the symlinks inside the snapshot only appear as
+	each file finalizes. A worker arriving mid-population sees a real directory
+	with zero shards in it — which is exactly what makes vLLM raise
+	"Cannot find any model weights <resolved path>".
+
+	Returns (ok, reason).
+	"""
+	if not os.path.isdir(path):
+		return False, f"snapshot directory does not exist: {path}"
+
+	shards = sorted(glob.glob(os.path.join(path, "*.safetensors")))
+	if not shards:
+		present = sorted(os.listdir(path))[:10] if os.path.isdir(path) else []
+		return False, (
+			f"no *.safetensors present (cache likely still populating); "
+			f"dir contains: {present}"
+		)
+
+	# Symlinks must resolve — a dangling link means the blob never landed.
+	broken = [os.path.basename(f) for f in shards if not os.path.exists(os.path.realpath(f))]
+	if broken:
+		return False, f"dangling shard symlink(s), blob missing: {broken[:5]}"
+
+	# Zero-byte shards mean an interrupted/partial write.
+	empty = [os.path.basename(f) for f in shards if os.path.getsize(os.path.realpath(f)) == 0]
+	if empty:
+		return False, f"zero-byte shard(s): {empty[:5]}"
+
+	# If a shard index exists, every shard it references must be here. This
+	# catches the "index arrived, shard N did not" partial-cache case.
+	index_path = os.path.join(path, "model.safetensors.index.json")
+	if os.path.isfile(index_path):
+		try:
+			with open(index_path) as f:
+				weight_map = json.load(f).get("weight_map", {})
+		except (json.JSONDecodeError, OSError) as exc:
+			return False, f"unreadable shard index: {exc}"
+		expected = set(weight_map.values())
+		found = {os.path.basename(f) for f in shards}
+		missing = sorted(expected - found)
+		if missing:
+			return False, f"index references {len(expected)} shard(s), missing: {missing[:5]}"
+
+	# config.json is required for vLLM to build the model.
+	if not os.path.isfile(os.path.join(path, "config.json")):
+		return False, "config.json missing from snapshot"
+
+	return True, f"{len(shards)} shard(s) verified"
+
+def await_valid_snapshot(path: str, timeout: int, poll: int) -> str:
+	"""
+	Poll until the snapshot is complete, or give up after `timeout` seconds.
+
+	A mid-population cache is transient: waiting usually resolves it. Failing
+	instantly would kill workers that would have been fine seconds later, while
+	waiting forever would hang the request — so this is bounded.
+	"""
+	deadline = time.monotonic() + timeout
+	attempt = 0
+	while True:
+		ok, reason = validate_snapshot(path)
+		if ok:
+			if attempt:
+				print(f"[init] snapshot became valid after {attempt} retry(ies): {reason}")
+			return path
+		attempt += 1
+		if time.monotonic() >= deadline:
+			raise RuntimeError(
+				f"Model weights unusable after waiting {timeout}s. Reason: {reason}. "
+				f"Path: {path}. This worker's host cache is incomplete."
+			)
+		print(f"[init] waiting for model cache ({reason}); retry {attempt}...", flush=True)
+		time.sleep(poll)
 
 def resolve_snapshot_path(model_id: str, revision: str | None = None) -> str:
 	"""
@@ -146,6 +237,9 @@ async def get_engine() -> tuple[AsyncLLM, int]:
 		# fully deterministic — no revision resolution, no network, no download —
 		# so concurrent cold-starts can't race on a partial cache.
 		local_model_path = resolve_snapshot_path(MODEL_NAME, MODEL_REVISION)
+		# Verify the shards are actually there before handing the path to vLLM.
+		# A resolvable directory is not the same as a populated one.
+		await_valid_snapshot(local_model_path, CACHE_WAIT_SECONDS, CACHE_POLL_SECONDS)
 		print(f"[init] loading from managed cache: {local_model_path}")
 
 		engine_args = AsyncEngineArgs(
@@ -297,7 +391,21 @@ async def handler(job):
 	try:
 		engine, max_model_len = await get_engine()
 	except Exception as exc:
-		return {"error": f"Engine initialisation failed: {exc}"}
+		# Engine init failure is NOT recoverable in-process: _engine stays None,
+		# so every later request retries and fails identically, leaving a zombie
+		# worker that accepts jobs it can never serve (the 'manually eliminate
+		# the worker' symptom). Report the error for this job, then take the
+		# worker down so RunPod replaces it and routes work to a healthy host.
+		msg = f"Engine initialisation failed: {exc}"
+		print(f"[fatal] {msg}", file=sys.stderr, flush=True)
+		if EXIT_ON_MODEL_FAILURE:
+			print("[fatal] terminating worker so RunPod can replace it", file=sys.stderr, flush=True)
+			# Flush, then hard-exit: os._exit skips atexit/cleanup handlers that
+			# can hang on a half-initialised vLLM EngineCore subprocess.
+			sys.stderr.flush()
+			sys.stdout.flush()
+			os._exit(1)
+		return {"error": msg}
 
 	truncate_len = max_model_len - 1
 	job_id       = job.get("id", uuid.uuid4().hex)
