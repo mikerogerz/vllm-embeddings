@@ -46,7 +46,7 @@ CACHE_POLL_SECONDS = int(os.environ.get("CACHE_POLL_SECONDS", "5"))
 # worker instead of leaving it alive returning errors forever.
 EXIT_ON_MODEL_FAILURE = os.environ.get("EXIT_ON_MODEL_FAILURE", "true").lower() == "true"
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", None)
-GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
+#GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
 TRUST_REMOTE_CODE = os.environ.get("TRUST_REMOTE_CODE", "False").lower() == "true"
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", 5))
 ENABLE_CHUNKED_PROCESSING = os.environ.get("ENABLE_CHUNKED_PROCESSING", "true").lower() == "true"
@@ -250,7 +250,7 @@ async def get_engine() -> tuple[AsyncLLM, int]:
 			max_model_len=None, # auto-detect from model config
 			enforce_eager=True,
 			enable_prefix_caching=True,
-			gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+			#gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
 			pooler_config=pooler_config,
 		)
 
